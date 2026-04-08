@@ -1,0 +1,8 @@
+google-adk==1.14.0
+python-telegram-bot
+composio
+python-dotenv
+fastapi
+pydantic
+uvicorn
+requests

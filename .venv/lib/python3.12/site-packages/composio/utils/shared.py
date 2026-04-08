@@ -1,0 +1,504 @@
+"""
+Shared utils.
+"""
+
+import copy
+import keyword
+import typing as t
+import uuid
+from inspect import Parameter
+
+from pydantic import BaseModel, Field, create_model
+from pydantic.fields import FieldInfo
+
+from composio.utils.logging import get as get_logger
+from composio.utils.schema_converter import (
+    CONTAINER_TYPE,
+    FALLBACK_VALUES,
+    PYDANTIC_TYPE_TO_PYTHON_TYPE,
+    json_schema_to_pydantic_type,
+)
+
+logger = get_logger(__name__)
+
+# Re-export for backward compatibility
+__all__ = [
+    "json_schema_to_pydantic_type",
+    "PYDANTIC_TYPE_TO_PYTHON_TYPE",
+    "CONTAINER_TYPE",
+    "FALLBACK_VALUES",
+    "json_schema_to_pydantic_field",
+    "json_schema_to_fields_dict",
+    "json_schema_to_model",
+    "pydantic_model_from_param_schema",
+    "get_signature_format_from_schema_params",
+    "get_pydantic_signature_format_from_schema_params",
+    "generate_request_id",
+    "substitute_reserved_python_keywords",
+    "reinstate_reserved_python_keywords",
+]
+
+reserved_names = ["validate"]
+
+_OBJ_MARKER = "-_object_-"
+
+
+def _make_safe_name(name: str) -> str:
+    """Append ``_rs`` to a Python keyword so it can be used as a parameter name."""
+    return f"{name}_rs"
+
+
+def substitute_reserved_python_keywords(
+    schema: t.Dict,
+) -> t.Tuple[dict, dict]:
+    """Replace Python reserved keywords in a JSON schema's property names.
+
+    Returns a ``(schema, keywords)`` tuple where *schema* has safe property
+    names and *keywords* maps each safe name back to the original.  Nested
+    object schemas are processed recursively.
+
+    The schema is deep-copied before any mutation so the caller's original
+    is never modified.
+    """
+    if "properties" not in schema:
+        return schema, {}
+
+    schema = copy.deepcopy(schema)
+
+    keywords: t.Dict[str, t.Any] = {}
+    for p_name in list(schema["properties"]):
+        if not keyword.iskeyword(p_name):
+            continue
+
+        _nested_kw: t.Dict[str, t.Any] = {}
+        p_val = schema["properties"].pop(p_name)
+        if p_val.get("type") == "object":
+            p_val, _nested_kw = substitute_reserved_python_keywords(schema=p_val)
+
+        safe = _make_safe_name(p_name)
+        schema["properties"][safe] = p_val
+        keywords[safe] = p_name
+        keywords[f"{safe}{_OBJ_MARKER}"] = _nested_kw
+
+    # Also rename entries in the ``required`` list.
+    if keywords and "required" in schema:
+        reverse = {v: k for k, v in keywords.items() if not k.endswith(_OBJ_MARKER)}
+        schema["required"] = [reverse.get(r, r) for r in schema["required"]]
+
+    return schema, keywords
+
+
+def reinstate_reserved_python_keywords(
+    request: dict,
+    keywords: dict,
+) -> dict:
+    """Reverse the substitution performed by :func:`substitute_reserved_python_keywords`.
+
+    Modifies *request* **in-place** and returns it.
+    """
+    for clean_key in sorted(list(keywords), reverse=True):
+        subkeys = None
+        if clean_key.endswith(_OBJ_MARKER):
+            subkeys = keywords[clean_key]
+            clean_key, _ = clean_key.split(_OBJ_MARKER, maxsplit=1)
+
+        if clean_key not in request:
+            continue
+
+        original_value = request.pop(clean_key)
+        if subkeys:
+            original_value = reinstate_reserved_python_keywords(
+                request=original_value,
+                keywords=subkeys,
+            )
+        request[keywords[clean_key]] = original_value
+    return request
+
+
+def _coerce_default_value(
+    default: t.Any,
+    json_schema: t.Dict[str, t.Any],
+) -> t.Any:
+    """
+    Coerce a default value to match the expected type from JSON schema.
+
+    Handles common mismatches where string defaults should be boolean/int/float.
+    This fixes issues where API returns stringified defaults like "true" instead of true.
+
+    Coercion precedence: boolean > integer > float. This means values like "1" and "0"
+    become booleans when both bool and int are expected types.
+
+    :param default: The default value from the JSON schema.
+    :param json_schema: The JSON schema property definition.
+    :return: The coerced default value, or original if no coercion possible.
+    """
+    if default is None or not isinstance(default, str):
+        return default
+
+    # Collect expected types from schema
+    expected_types: t.Set[t.Any] = set()
+
+    if "type" in json_schema:
+        py_type = PYDANTIC_TYPE_TO_PYTHON_TYPE.get(json_schema["type"])
+        if py_type is not None:
+            expected_types.add(py_type)
+
+    for combiner in ("anyOf", "oneOf", "allOf"):
+        for option in json_schema.get(combiner, []):
+            if isinstance(option, dict):
+                option_type = option.get("type")
+                if isinstance(option_type, str):
+                    py_type = PYDANTIC_TYPE_TO_PYTHON_TYPE.get(option_type)
+                    if py_type is not None:
+                        expected_types.add(py_type)
+
+    # If string is expected, no coercion needed
+    if str in expected_types:
+        return default
+
+    # Boolean coercion (takes precedence over int for "1"/"0")
+    if bool in expected_types:
+        lower_default = default.lower()
+        if lower_default in ("true", "yes", "1"):
+            return True
+        if lower_default in ("false", "no", "0"):
+            return False
+
+    # Integer coercion
+    if int in expected_types:
+        try:
+            return int(default)
+        except ValueError:
+            pass
+
+    # Float coercion
+    if float in expected_types:
+        try:
+            return float(default)
+        except ValueError:
+            pass
+
+    return default
+
+
+def json_schema_to_pydantic_field(
+    name: str,
+    json_schema: t.Dict[str, t.Any],
+    required: t.List[str],
+    skip_default: bool = False,
+) -> t.Tuple[str, t.Type, FieldInfo]:
+    """
+    Converts a JSON schema property to a Pydantic field definition.
+
+    :param name: The field name.
+    :param json_schema: The JSON schema property.
+    :param required: List of required properties.
+    :return: A Pydantic field definition.
+    """
+    description = json_schema.get("description")
+    if "oneOf" in json_schema:
+        description = " | ".join(
+            [option.get("description", "") for option in json_schema["oneOf"]]
+        )
+        description = f"Any of the following options(separated by |): {description}"
+
+    examples = json_schema.get("examples", [])
+    default = json_schema.get("default")
+
+    # Coerce default value to match expected type from schema
+    if default is not None:
+        default = _coerce_default_value(default, json_schema)
+
+    # Check if the field name is a reserved Pydantic name
+    if name in reserved_names:
+        name = f"{name}_"
+        alias = name
+    else:
+        alias = None
+
+    field = {
+        "description": description,
+        "examples": examples,
+        "alias": alias,
+    }
+    if not skip_default:
+        field["default"] = ... if name in required else default
+
+    return (
+        name,
+        t.cast(
+            t.Type,
+            json_schema_to_pydantic_type(
+                json_schema=json_schema,
+            ),
+        ),
+        Field(**field),  # type: ignore
+    )
+
+
+def json_schema_to_fields_dict(json_schema: t.Dict[str, t.Any]) -> t.Dict[str, t.Any]:
+    """
+    Converts a JSON schema to a dictionary of param name, and a tuple of type & Field.
+
+    :param json_schema: The JSON schema to convert.
+    :return: dict<str, tuple<<class 'type'>, Field>>
+
+    Example Output:
+    ```python
+    {
+        'owner': (<class 'str'>, FieldInfo(default=Ellipsis, description='The account owner of the repository.', extra={'examples': ([],)})),
+        'repo': (<class 'str'>, FieldInfo(default=Ellipsis, description='The name of the repository without the `.git` extension.', extra={'examples': ([],)}))}
+    }
+    ```
+
+    """
+    field_definitions = {}
+    for name, prop in json_schema.get("properties", {}).items():
+        updated_name, pydantic_type, pydantic_field = json_schema_to_pydantic_field(
+            name, prop, json_schema.get("required", [])
+        )
+        field_definitions[updated_name] = (pydantic_type, pydantic_field)
+    return field_definitions  # type: ignore
+
+
+def json_schema_to_model(
+    json_schema: t.Dict[str, t.Any],
+    skip_default: bool = False,
+) -> t.Type[BaseModel]:
+    """
+    Converts a JSON schema to a Pydantic BaseModel class.
+
+    :param json_schema: The JSON schema to convert.
+    :param skip_default: Skip the default values when building field object
+    :return: Pydantic `BaseModel` type
+    """
+    model_name = json_schema.get("title")
+    field_definitions = {}
+    for name, prop in json_schema.get("properties", {}).items():
+        updated_name, pydantic_type, pydantic_field = json_schema_to_pydantic_field(
+            name,
+            prop,
+            json_schema.get("required", []),
+            skip_default=skip_default,
+        )
+        field_definitions[updated_name] = (pydantic_type, pydantic_field)
+    return create_model(model_name, **field_definitions)  # type: ignore
+
+
+def pydantic_model_from_param_schema(param_schema: t.Dict) -> t.Type:
+    """
+    Dynamically creates a Pydantic model from a schema dictionary.
+
+    :param param_schema: Schema with 'title', 'properties', and optionally 'required' keys.
+    :return: A Pydantic model class for the defined schema.
+
+    :raised ValueError: Invalid 'type' for property or recursive model creation.
+
+    Note: Requires global `schema_type_python_type_dict` for type mapping and
+        `fallback_values` for default values.
+    """
+    required_fields = {}
+    optional_fields = {}
+    if "title" not in param_schema:
+        raise ValueError(f"Missing 'title' in param_schema: {param_schema}")
+
+    param_title = str(param_schema["title"]).replace(" ", "")
+    required_props = param_schema.get("required", [])
+
+    if param_schema.get("type") == "array":
+        # print("param_schema inside array - ", param_schema)
+        item_schema = param_schema.get("items")
+        if item_schema:
+            ItemType = t.cast(
+                t.Type,
+                json_schema_to_pydantic_type(
+                    json_schema=item_schema,
+                ),
+            )
+            return t.List[ItemType]  # type: ignore
+        return t.List
+
+    for prop_name, prop_info in param_schema.get("properties", {}).items():
+        prop_type = prop_info.get("type")
+        prop_title = prop_info.get("title", prop_name).replace(" ", "")
+        prop_default = prop_info.get("default", FALLBACK_VALUES.get(prop_type))
+        if (
+            prop_type is not None
+            and prop_type in PYDANTIC_TYPE_TO_PYTHON_TYPE
+            and prop_type not in CONTAINER_TYPE
+        ):
+            signature_prop_type = PYDANTIC_TYPE_TO_PYTHON_TYPE[prop_type]
+        elif prop_type is None:
+            # Schema uses anyOf/allOf/oneOf/$ref instead of a top-level "type" key.
+            # Delegate to json_schema_to_pydantic_type which handles all combiners.
+            signature_prop_type = t.cast(
+                t.Type,
+                json_schema_to_pydantic_type(json_schema=prop_info),
+            )
+        else:
+            signature_prop_type = pydantic_model_from_param_schema(prop_info)
+
+        field_kwargs = {
+            "description": prop_info.get(
+                "description", prop_info.get("desc", prop_title)
+            ),
+        }
+
+        # Add alias if the field name is a reserved Pydantic name
+        if prop_name in reserved_names:
+            field_kwargs["alias"] = prop_name
+            field_kwargs["title"] = f"{prop_name}_"
+        else:
+            field_kwargs["title"] = prop_title
+
+        if prop_name in required_props:
+            required_fields[prop_name] = (
+                signature_prop_type,
+                Field(..., **field_kwargs),
+            )
+        else:
+            optional_fields[prop_name] = (
+                signature_prop_type,
+                Field(default=prop_default, **field_kwargs),
+            )
+
+    if not required_fields and not optional_fields:
+        return t.Dict
+
+    return create_model(  # type: ignore
+        param_title,
+        **required_fields,
+        **optional_fields,
+    )
+
+
+def get_signature_format_from_schema_params(
+    schema_params: t.Dict,
+    skip_default: bool = False,
+) -> t.List[Parameter]:
+    """
+    Get function parameters signature(with pydantic field definition as default values)
+    from schema parameters. Works like:
+
+    def demo_function(
+        owner: str,
+        repo: str),
+    )
+
+    :param schema_params: A dictionary object containing schema params, with keys [properties, required etc.].
+    :return: List of required and optional parameters
+
+    Output Format:
+    [
+        <Parameter "owner: str">,
+        <Parameter "repo: str">
+    ]
+    """
+    default_parameters = []
+    none_default_parameters = []
+
+    required_params = schema_params.get("required", [])
+    schema_params_object = schema_params.get("properties", {})
+    for param_name, param_schema in schema_params_object.items():
+        param_type = param_schema.get("type", None)
+        param_oneOf = param_schema.get("oneOf", None)
+        param_anyOf = param_schema.get("anyOf", None)
+        param_allOf = param_schema.get("allOf", None)
+        if param_allOf is not None and len(param_allOf) == 1:
+            param_type = param_allOf[0].get("type", None)
+        if param_oneOf is not None or param_anyOf is not None:
+            param_types = [ptype.get("type") for ptype in (param_oneOf or param_anyOf)]
+            if len(param_types) == 1:
+                annotation = PYDANTIC_TYPE_TO_PYTHON_TYPE[param_types[0]]
+            elif len(param_types) == 2:
+                # Check as redefinition and union was incompatible
+                # @karan to check if this is the right way to do it
+                t1: t.Type = PYDANTIC_TYPE_TO_PYTHON_TYPE[param_types[0]]  # type: ignore
+                t2: t.Type = PYDANTIC_TYPE_TO_PYTHON_TYPE[param_types[1]]  # type: ignore
+                annotation: t.Type = t.Union[t1, t2]  # type: ignore
+            elif len(param_types) == 3:
+                t1: t.Type = PYDANTIC_TYPE_TO_PYTHON_TYPE[param_types[0]]  # type: ignore
+                t2: t.Type = PYDANTIC_TYPE_TO_PYTHON_TYPE[param_types[1]]  # type: ignore
+                t3: t.Type = PYDANTIC_TYPE_TO_PYTHON_TYPE[param_types[2]]  # type: ignore
+                annotation: t.Type = t.Union[t1, t2, t3]  # type: ignore
+            else:
+                raise ValueError("Invalid 'oneOf' schema")
+            param_default = param_schema.get("default", "")
+        elif param_type in PYDANTIC_TYPE_TO_PYTHON_TYPE:
+            annotation = PYDANTIC_TYPE_TO_PYTHON_TYPE[param_type]
+            param_default = param_schema.get("default", FALLBACK_VALUES[param_type])
+        else:
+            annotation = pydantic_model_from_param_schema(param_schema)
+            if param_type is None or param_type == "null":
+                param_default = None
+            else:
+                param_default = param_schema.get("default", FALLBACK_VALUES[param_type])
+
+        default = param_default
+        required = param_schema.get("required", False) or param_name in required_params
+        if required:
+            default = Parameter.empty
+
+        if skip_default:
+            default = Parameter.empty
+
+        parameter = Parameter(
+            name=param_name,
+            kind=Parameter.POSITIONAL_OR_KEYWORD,
+            annotation=annotation,
+            default=default,
+        )
+        if required:
+            default_parameters.append(parameter)
+            continue
+        none_default_parameters.append(parameter)
+    return default_parameters + none_default_parameters
+
+
+def get_pydantic_signature_format_from_schema_params(
+    schema_params: t.Dict,
+    skip_default: bool = False,
+) -> t.List[Parameter]:
+    """
+    Get function parameters signature(with pydantic field definition as default values)
+    from schema parameters. Works like:
+
+    def demo_function(
+        owner: str=Field(..., description='The account owner of the repository.'),
+        repo: str=Field(..., description='The name of the repository without the `.git` extension.'),
+    )
+
+    :param schema_params: A dictionary object containing schema params, with keys [properties, required etc.].
+    :return: List of required and optional parameters
+
+    Example Output Format:
+    ```python
+    [
+        <Parameter "owner: str = FieldInfo(
+            default=Ellipsis,
+            description='The account owner of the repository.',
+            extra={'examples': ([],)})">,
+        <Parameter "repo: str = FieldInfo(
+            default=Ellipsis,
+            description='The name of the repository without the `.git` extension.',
+            extra={'examples': ([],)})">
+    ]
+    ```
+    """
+    all_parameters = []
+    field_definitions = json_schema_to_fields_dict(schema_params)
+    for param_name, (param_dtype, parame_field) in field_definitions.items():
+        param = Parameter(
+            name=param_name,
+            kind=Parameter.POSITIONAL_OR_KEYWORD,
+            annotation=param_dtype,
+            default=Parameter.empty if skip_default else parame_field.default,
+        )
+        all_parameters.append(param)
+
+    return all_parameters
+
+
+def generate_request_id() -> str:
+    """Generate a unique request ID."""
+    return str(uuid.uuid4())
