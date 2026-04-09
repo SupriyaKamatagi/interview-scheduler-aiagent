@@ -252,7 +252,7 @@ async def handle_user_message(user_input: str) -> str:
     )
 
 import os
-model=os.getenv("MODEL", "gemini-1.5-flash")
+model=os.getenv("MODEL", "gemini-2.5-flash")
 
 root_agent = LlmAgent(
     name="InterviewSchedulerAgent",
