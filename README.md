@@ -180,3 +180,9 @@ QUICK FORK & RUN
 3. Add your .env and credentials (not included in repo)
 4. Run "adk run interview_scheduler/" to start the agent
 5. Deploy to Cloud Run for production use
+
+## License
+This project is licensed under the **MIT License** – you are free to use, modify, and distribute it in accordance with the terms of the license.
+
+## Author
+Created and maintained by **Supriya Kamatagi**
